@@ -1,0 +1,2505 @@
+---
+title: "NHANES - Gas Stove"
+date: "2025-08-11"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4   # levels of headers to include (h1, h2, h3)
+    toc_float: true  # makes the TOC float on the side
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(missForest)
+library(tibble)
+library(survey)
+library(flextable)
+```
+
+# Recent gas stove use and asthma exacerbations in adults enrolled in NHANES 2013-2018
+
+Curtis L Nordgaard, Andee Krasner, Aline Maybank, Flannery Black-Ingersoll, Molly Kile, Jonathan J Buonocore, Mary D Willis
+
+## 1. Imputation
+
+Read in the data:
+
+```{r data, warning=FALSE}
+merged_nhanes <- read_csv("merged_nhanes_all.csv")
+```
+
+Define dichotomous and categorical variables prior to imputation:
+
+-   Asthma exacerbation: MCQ040 -\> MCQ040_bin (1/0 : yes/no)
+
+-   ER Visit for Asthma: MCQ050 -\> MCQ050_bin (1/0 : yes/no)
+
+-   Gas stove use: VTQ241A -\> VTQ241A_bin (1/0 : yes/no)
+
+-   Own/Rent Home: HOQ065 -\> housing_status (1 own, 2 rent, 3 other)
+
+```{r recode, echo=TRUE, warning=FALSE}
+merged_nhanes <- merged_nhanes %>%
+  mutate(    # Asthma exacerbation? NHANES 1 = Yes, 2 = No -> 0 = No, 1 = Yes
+    MCQ040_bin = case_when(
+      MCQ040 == 1 ~ 1,
+      MCQ040 == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # ER visit due to asthma? NHANES 1 = Yes, 2 = No -> 0 = No, 1 = Yes
+    MCQ050_bin = case_when(
+      MCQ050 == 1 ~ 1,
+      MCQ050 == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # Gas stove use (exposure) NHANES 1 = Yes, 2 = No -> 0 = No, 1 = Yes
+    VTQ241A_bin = case_when(
+      VTQ241A == 1 ~ 1,
+      VTQ241A == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    #Housing (owned vs rented)
+    housing_status = case_when(
+      HOQ065 == 1 ~ "Owned",
+      HOQ065 == 2 ~ "Rented",
+      HOQ065 == 3 ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    
+    Smoking = case_when(
+      SMQ040 == 1 ~ "Current",
+      SMQ040 == 2 ~ "Current",
+      SMQ040 == 3 ~ "Former",
+      SMQ020 == 2 ~ "Never",
+      SMQ020 == 7 ~ "Never",
+      SMQ020 == 9 ~ "Never",
+      TRUE ~ NA_character_
+    ),
+  )
+
+```
+
+Define variables for imputation and filter and subset for imputation.
+
+*Filters:*
+
+-   Must have current asthma: MCQ035 = 1
+-   Must be over 18 years of age: RIDAGEYR \>= 18
+-   Must have received VOC questionnaire: WTVOC2Y != NA
+
+```{r Define_Imputation-Vars}
+vars_to_impute_adults <- c(
+  "RIDAGEYR",  # Age
+  "RIAGENDR",  # Sex
+  "RIDRETH3",  # Race/ethnicity
+  "INDFMPIR",  # Income
+  "housing_status",    # Housing
+  "VTQ241A_bin",   # Cooked with gas
+  "MCQ040_bin",    # Asthma exacerbation
+  "MCQ050_bin"     # Asthma ER visit
+)
+
+id_vars <- c("SEQN", "SDMVPSU", "SDMVSTRA", "WTMEC2YR", "WTSVOC2Y", "YEAR")
+vars_to_keep_but_not_impute <- c("MCQ035", "SMQ040", "SMQ020")
+
+# Imputing for 'Response Sample', Current asthma, given VOC questionnaire, adults
+subset_for_impute <- merged_nhanes %>%
+  filter(MCQ035 == 1, !is.na(WTSVOC2Y), RIDAGEYR >= 18) %>% 
+  # WTSVOC2Y given questionnaire
+  select(all_of(c(id_vars, vars_to_impute_adults, vars_to_keep_but_not_impute)))
+
+```
+
+Do missForest imputation on gas stove exposure, asthma exacerbation, asthma ER visit, housing status, income:
+
+```{r Impute1, warning=FALSE}
+rownames(subset_for_impute) <- subset_for_impute$SEQN
+data_to_impute <- subset_for_impute[, vars_to_impute_adults]
+data_to_impute <- as.data.frame(data_to_impute)
+
+data_to_impute <- data_to_impute %>% mutate_at(c("housing_status", "VTQ241A_bin", "MCQ040_bin", "MCQ050_bin"), as.factor)
+
+set.seed(234)
+imputation_model_rf <- missForest(data_to_impute,verbose = T) # verbose will print out the errors and show you where the imputation stops
+
+```
+
+```{r Impute2, warning=FALSE, include=FALSE}
+imputed_df <- imputation_model_rf$ximp
+imputed_df <- rownames_to_column(imputed_df, var = "SEQN")
+
+# Check for any remaining missing values
+colSums(is.na(imputed_df))
+
+# bring back the rest of the variables
+other_variables <- merged_nhanes %>% select(!vars_to_impute_adults)
+# Next line assumes order of rows (SEQN) unaltered during imputation; appears true
+imputed_df$SEQN <- subset_for_impute$SEQN
+# Next line updated to keep all rows from full original data set
+nhanes_imputed <- merge(other_variables, imputed_df, by = "SEQN", all.x = TRUE)
+
+```
+
+Categorize the rest of the variables needed for analysis:
+
+-   Still have asthma: MCQ035 -\> MCQ035_bin (1/0 : yes/no)
+
+-   PIR-based income category: INDFMPIR -\> income_cat (Low: \< 1.7, Medium: 1.8-3.8, High: 3.9-5)
+
+-   Race/ethnicity: RIDRETH3 -\> RaceEthn (1, 2: LatinX; 3: White; 4: Black; 4:
+
+-   Smoking status: SMQ040 -\> SMQ040_bin (Regular/Sometimes:1, No: 0)
+
+-   BIPOC: RIDRETH3 -\> Bipoc (NonHispanic & (White OR Black): 0, Any other category: 1)
+
+-   Age: RIDAGEYR -\> age_cat (Adult: 18-64; Older: 65+)
+
+```{r Recode_Vars}
+nhanes_imputed <- nhanes_imputed %>%
+  mutate(
+    # Outcome: Still have asthma? NHANES 1 = Yes, 2 = No -> 0 = No, 1 = Yes
+    MCQ035_bin = case_when(
+      MCQ035 == 1 ~ 1,
+      MCQ035 == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # PIR-based income category: Low, Medium, High
+    income_cat = case_when(
+      INDFMPIR < 1.8 ~ "Low",
+      INDFMPIR >= 1.8 & INDFMPIR < 3.9 ~ "Medium",
+      INDFMPIR >= 3.9 & INDFMPIR <= 5 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    
+    #Race/Ethnicity
+    RaceEthn = case_when(
+      RIDRETH3 == 1 ~ "LatinX",
+      RIDRETH3 == 2 ~ "LatinX",
+      RIDRETH3 == 3 ~ "White",
+      RIDRETH3 == 4 ~ "Black",
+      RIDRETH3 == 6 ~ "Asian",
+      RIDRETH3 == 7 ~ "OtherMulti"
+    ),
+    # (exposure) NHANES 1 = Regular, 2 = sometimes, 3 = No -> 0 = No, 1 = Yes
+    SMQ040_bin = case_when(
+      SMQ040 == 1 ~ 1,
+      SMQ040 == 2 ~ 1,
+      SMQ040 == 3 ~ 0,
+      TRUE ~ NA_real_
+    ),  
+    #    Ever smoked? NHANES 1 = Yes, 2 = No -> 0 = No, 1 = Yes
+    SMQ020_bin = case_when(
+     SMQ020 == 1 ~ 1,
+      SMQ020 == 2 ~ 0,
+     TRUE ~ NA_real_
+    ),
+    # Single variable with smoking status (for demographic tables); coding 7 and 9 as "never" to assign single case with nonresponse for SMQ020 as "Never"
+    Smoking = case_when(
+      SMQ040 == 1 ~ "Current",
+      SMQ040 == 2 ~ "Current",
+      SMQ040 == 3 ~ "Former",
+      SMQ020 == 2 ~ "Never",
+      SMQ020 == 7 ~ "Never",
+      SMQ020 == 9 ~ "Never",
+      TRUE ~ NA_character_
+    ),
+    
+    Bipoc = case_when(
+      RIDRETH3 == 1 ~ "Yes",
+      RIDRETH3 == 2 ~ "Yes",
+      RIDRETH3 == 3 ~ "No",
+      RIDRETH3 == 4 ~ "No",
+      RIDRETH3 == 6 ~ "Yes",
+      RIDRETH3 == 7 ~ "Yes"
+    ),
+    
+    age_cat = case_when(
+      RIDAGEYR >= 18 & RIDAGEYR <65 ~ "Adult",
+      RIDAGEYR >= 65 ~ "Older",
+      TRUE ~ NA_character_),
+  )
+
+# Recode variables as factors - two levels
+nhanes_imputed <- nhanes_imputed %>% mutate_at(c("MCQ035_bin", "MCQ040_bin", "MCQ050_bin","VTQ241A_bin","housing_status", "RIAGENDR", "SMQ040_bin", "RaceEthn"), as.factor)
+
+# Recode variables as ordered factors - high inc as baseline
+nhanes_imputed$income_cat <- factor(nhanes_imputed$income_cat, levels = c("High", "Medium", "Low"))
+```
+
+On the non-imputed data: create a 6-year VOC weight and filter for VOC questionnaire data (which has all VOC data for weighting).
+
+```{r VOC_weight}
+nhanes_NoImpute <- merged_nhanes %>%
+  mutate(WTSVOC6YR = WTSVOC2Y / 3)
+
+VOC_NoImpute <- nhanes_NoImpute %>% drop_na(WTSVOC6YR)
+
+VOC_NoImpute <- VOC_NoImpute %>%
+  mutate(
+    income_cat = case_when(
+      INDFMPIR < 1.8 ~ "Low",
+      INDFMPIR >= 1.8 & INDFMPIR < 3.9 ~ "Medium",
+      INDFMPIR >= 3.9 & INDFMPIR <= 5 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    age_cat = case_when(
+        RIDAGEYR >= 18 & RIDAGEYR <65 ~ "Adult",
+        RIDAGEYR >= 65 ~ "Older",
+        TRUE ~ NA_character_),
+    house_cat = case_when(
+        HOQ065 == 1 ~ "Own",
+        HOQ065 == 2 ~ "Rent",
+        HOQ065 == 3 ~ "Other",
+        TRUE ~ NA_character_
+    ),
+       #Race/Ethnicity
+    RaceEthn = case_when(
+      RIDRETH3 == 1 ~ "LatinX",
+      RIDRETH3 == 2 ~ "LatinX",
+      RIDRETH3 == 3 ~ "White",
+      RIDRETH3 == 4 ~ "Black",
+      RIDRETH3 == 6 ~ "Asian",
+      RIDRETH3 == 7 ~ "OtherMulti"
+    ),
+        # (exposure) NHANES 1 = Regular, 2 = sometimes, 3 = No -> 0 = No, 1 = Yes
+    SMQ040_bin = case_when(
+      SMQ040 == 1 ~ 1,
+      SMQ040 == 2 ~ 1,
+      SMQ040 == 3 ~ 0,
+      TRUE ~ NA_real_
+    ),
+        # Ever smoked? NHANES 1 = Yes, 2 = No -> 0 = No, 1 = Yes
+    SMQ020_bin = case_when(
+      SMQ020 == 1 ~ 1,
+      SMQ020 == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+            # Smoking history
+    Smoking_Response = case_when(
+      SMQ040 == 1 ~ "Current",
+      SMQ040 == 2 ~ "Current",
+      SMQ040 == 3 ~ "Former",
+      SMQ020 == 2 ~ "Never",
+      TRUE ~ NA_character_
+    )
+    )
+```
+
+## 2. Table 4 - Response Samples (from pre-imputed data, including complete and incomplete samples)
+
+### Response sample
+
+First, make sure we are only working with the subset of responses we are interested in:
+
+```{r}
+subset_for_impute <- subset_for_impute %>% mutate(
+  # PIR-based income category: Low, Medium, High
+    income_cat = case_when(
+      INDFMPIR < 1.8 ~ "Low",
+      INDFMPIR >= 1.8 & INDFMPIR < 3.9 ~ "Medium",
+      INDFMPIR >= 3.9 & INDFMPIR <= 5 ~ "High",
+      TRUE ~ NA_character_
+    ),    
+    age_cat = case_when(
+        RIDAGEYR >= 18 & RIDAGEYR <65 ~ "Adult",
+        RIDAGEYR >= 65 ~ "Older",
+        TRUE ~ NA_character_),
+    house_cat = case_when(
+        housing_status == 1 ~ "Own",
+        housing_status == 2 ~ "Rent",
+        housing_status == 3 ~ "Other",
+        TRUE ~ NA_character_
+    ),
+       #Race/Ethnicity
+    RaceEthn = case_when(
+      RIDRETH3 == 1 ~ "LatinX",
+      RIDRETH3 == 2 ~ "LatinX",
+      RIDRETH3 == 3 ~ "White",
+      RIDRETH3 == 4 ~ "Black",
+      RIDRETH3 == 6 ~ "Asian",
+      RIDRETH3 == 7 ~ "OtherMulti"
+    ),
+        # Smoking history
+    Smoking_Response = case_when(
+      SMQ040 == 1 ~ "Current",
+      SMQ040 == 2 ~ "Current",
+      SMQ040 == 3 ~ "Former",
+      SMQ020 == 2 ~ "Never",
+      TRUE ~ NA_character_
+    )
+    
+)  
+
+```
+
+Then, we define the survey design using imputed data set containing all VOC weights. We use this to calculate the weights in the response sample for each descriptive statistic.
+
+```{r Survey_design}
+VOCNoImp_svy_design <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTSVOC6YR,
+  nest = TRUE,
+  data = VOC_NoImpute
+)
+
+# Restrict to analysis subset (Age >= 18, current asthma, answered VTQ241A)
+NoImp_survey <- subset(VOCNoImp_svy_design, RIDAGEYR >= 18 & MCQ035 == 1)
+
+# Categorize as factor for svytotal
+NoImp_survey$variables <- NoImp_survey$variables %>% mutate_at(c("VTQ241A", "MCQ040", "MCQ050", "house_cat", "income_cat", "age_cat", "RIDRETH3", "RIAGENDR","SMQ020", "SMQ040"), as.factor)
+
+# Find the weights by category for this (the response) sample
+
+```
+
+(1) Gas Stove exposure
+
+```{r}
+table(subset_for_impute$VTQ241A_bin, useNA = "ifany")  # Gas stove exposure
+coef(svymean(~factor(VTQ241A), NoImp_survey, na.rm = TRUE) * 100)
+
+```
+
+(2) Asthma attack in last 12 months
+
+```{r}
+table(subset_for_impute$MCQ040_bin, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(MCQ040_bin), NoImp_survey, na.rm = TRUE) * 100)
+
+```
+
+(3) Asthma ER Visit in last 12 months
+
+```{r}
+table(subset_for_impute$MCQ050_bin, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(MCQ050_bin), NoImp_survey, na.rm = TRUE) * 100)
+
+```
+
+4.  Seniors
+
+```{r}
+table(subset_for_impute$age_cat, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(age_cat), NoImp_survey, na.rm = TRUE) * 100)
+```
+
+5.  Mean age (Standard Deviation)
+
+```{r}
+mean(subset_for_impute$RIDAGEYR, na.rm = T)
+sd(subset_for_impute$RIDAGEYR, na.rm = T)
+```
+
+6.  Race/Ethnicity
+
+```{r}
+table(subset_for_impute$RaceEthn, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(RaceEthn), NoImp_survey, na.rm = TRUE) * 100)
+```
+
+7.  Gender
+
+```{r}
+table(subset_for_impute$RIAGENDR, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(RIAGENDR), NoImp_survey, na.rm = TRUE) * 100)
+```
+
+8.  Poverty Income Ratio (PIR) - *before imputation*
+
+```{r}
+table(subset_for_impute$income_cat, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(income_cat), NoImp_survey, na.rm = TRUE) * 100)
+```
+
+9.  Housing Type - *before imputation*
+
+```{r}
+table(subset_for_impute$housing_status, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(housing_status), NoImp_survey, na.rm = TRUE) * 100)
+```
+
+10. Smoking status - *before imputation*
+
+```{r}
+table(subset_for_impute$Smoking_Response, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(Smoking_Response), NoImp_survey, na.rm = TRUE) * 100)
+```
+
+### Complete records sample
+
+Complete un-weighted records sample n (%)
+
+```{r Complete_records}
+# Unweighted counts
+CompleteCases_NoImp <- subset(VOC_NoImpute, 
+                      (VTQ241A == 1 | VTQ241A == 2) & RIDAGEYR >= 18 & MCQ035 == 1
+                      & !is.na(income_cat)
+                      & (house_cat == "Own" | house_cat == "Rent") 
+                      & !is.na(Smoking_Response)
+)
+
+# Restrict to analysis subset (Age >= 18, current asthma, answered VTQ241A/house/inc)
+CompleteCases_survey <- subset(VOCNoImp_svy_design, 
+                               RIDAGEYR >= 18 & MCQ035 == 1 & (VTQ241A == 1 | VTQ241A ==2)
+                               & (house_cat == "Own" | house_cat == "Rent")
+                               & !is.na(income_cat) & !is.na(Smoking_Response))
+
+# Categorize as factor for svytotal
+CompleteCases_survey$variables <- CompleteCases_survey$variables %>% mutate_at(c("VTQ241A", "MCQ040", "MCQ050","house_cat", "income_cat", "age_cat", "RIDRETH3","RIAGENDR", "SMQ020", "SMQ040"), as.factor)
+
+```
+
+1.  Gas Stove exposure and weights
+
+```{r}
+table(CompleteCases_NoImp$VTQ241A, useNA = "ifany")  # Gas stove exposure
+coef(svymean(~factor(VTQ241A), CompleteCases_survey, na.rm = TRUE) * 100)
+
+```
+
+(2) Asthma attack in last 12 months
+
+```{r}
+table(CompleteCases_NoImp$MCQ040, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(MCQ040), CompleteCases_survey, na.rm = TRUE) * 100)
+
+```
+
+(3) Asthma ER Visit in last 12 months
+
+```{r}
+table(CompleteCases_NoImp$MCQ050_bin, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(MCQ050_bin), CompleteCases_survey, na.rm = TRUE) * 100)
+```
+
+(4) Seniors
+
+```{r}
+table(CompleteCases_NoImp$age_cat, useNA = "ifany")   # Asthma exacerbation
+coef(svymean(~factor(age_cat), CompleteCases_survey, na.rm = TRUE) * 100)
+```
+
+5.  Mean age (Standard Deviation)
+
+```{r}
+mean(CompleteCases_NoImp$RIDAGEYR, na.rm = T)
+sd(CompleteCases_NoImp$RIDAGEYR, na.rm = T)
+```
+
+6.  Race/Ethnicity
+
+```{r}
+table(CompleteCases_NoImp$RaceEthn)
+coef(svymean(~factor(RIDRETH3), CompleteCases_survey, na.rm = TRUE) * 100)
+```
+
+7.  Gender
+
+```{r}
+table(CompleteCases_NoImp$RIAGENDR)
+coef(svymean(~factor(RIAGENDR), CompleteCases_survey, na.rm = TRUE) * 100)
+```
+
+8.  Poverty Income Ratio (PIR) - *before imputation*
+
+```{r}
+table(CompleteCases_NoImp$income_cat, useNA = "ifany")
+coef(svymean(~factor(income_cat), CompleteCases_survey, na.rm = TRUE) * 100)
+```
+
+9.  Housing Type - *before imputation*
+
+```{r}
+table(CompleteCases_NoImp$housing_status, useNA = "ifany")
+coef(svymean(~factor(housing_status), CompleteCases_survey, na.rm = TRUE) * 100)
+```
+
+10. Smoking status - *before imputation*
+
+```{r}
+table(CompleteCases_NoImp$Smoking_Response, useNA = "ifany")
+coef(svymean(~factor(Smoking_Response), CompleteCases_survey, na.rm = TRUE) * 100)
+```
+
+## 3. Prepare data for models
+
+We want to use the weighted survey design dataset for the models. Here, we construct the weighted data set, ***this time using the imputed dataframe***:
+
+```{r weighted_parent-survey}
+# Allow for adjustment of 'lonely PSUs'
+options(survey.adjust.domain.lonely=TRUE)
+options(survey.lonely.psu="adjust")
+
+# Step 1: Create 6-year VOC weight
+nhanes_imputed <- nhanes_imputed %>%
+  mutate(WTSVOC6YR = WTSVOC2Y / 3)
+
+# Step 2: Filter for VOC questionnaire data; has all VOC data for weighting
+VOC_imputed <- nhanes_imputed %>% drop_na(WTSVOC6YR)
+#NoZeros <- filter(VOC_imputed, WTSVOC6YR > 0)
+
+# Step 3: Define survey design using imputed data set containing all VOC weights
+VOC_svy_design <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTSVOC6YR,
+  nest = TRUE,
+  data = VOC_imputed
+)
+
+# Step 3b: Set initial model start coefficients if needed
+Unweighted_Imp <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1
+                         & housing_status != "Other")
+initial <- c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0)
+```
+
+## 4. Table 1
+
+```{r}
+#Imputed Sample survey object; use for both weighted & unweighted counts
+Imputed_svy <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                      & housing_status != "Other")
+
+```
+
+### Total (N, weighted %)
+
+(1) Gas Stove exposure and weights
+
+```{r warning=FALSE}
+
+# Example: Gas stove exposure (Total, Unexposed, Exposed)
+table(Imputed_svy$variables$VTQ241A_bin, useNA = "ifany")
+coef(svymean(~factor(VTQ241A_bin), Imputed_svy, na.rm = TRUE) * 100)
+
+
+```
+
+(2) Asthma attack in last 12 months
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$MCQ040_bin, useNA = "ifany") 
+coef(svymean(~factor(MCQ040_bin), Imputed_svy, na.rm = TRUE) * 100)
+
+```
+
+(3) Asthma ER Visit in last 12 months
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$MCQ050_bin, useNA = "ifany") 
+coef(svymean(~factor(MCQ050_bin), Imputed_svy, na.rm = TRUE) * 100)
+```
+
+(4) Seniors
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$age_cat, useNA = "ifany") 
+coef(svymean(~factor(age_cat), Imputed_svy, na.rm = TRUE) * 100)
+```
+
+5.  Mean age (Standard Deviation)
+
+```{r warning=FALSE}
+mean(Imputed_svy$variables$RIDAGEYR, na.rm = T)
+sd(Imputed_svy$variables$RIDAGEYR, na.rm = T)
+```
+
+6.  Race/Ethnicity
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$RaceEthn, useNA = "ifany") 
+coef(svymean(~factor(RaceEthn), Imputed_svy, na.rm = TRUE) * 100)
+```
+
+7.  Gender
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$RIAGENDR, useNA = "ifany") 
+coef(svymean(~factor(RIAGENDR), Imputed_svy, na.rm = TRUE) * 100)
+```
+
+8.  Poverty Income Ratio (PIR) 
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$income_cat, useNA = "ifany") 
+coef(svymean(~factor(income_cat), Imputed_svy, na.rm = TRUE) * 100)
+```
+
+9.  Housing Type
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$housing_status, useNA = "ifany") 
+coef(svymean(~factor(housing_status), Imputed_svy, na.rm = TRUE) * 100)
+```
+
+10. Smoking status
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$Smoking, useNA = "ifany") 
+coef(svymean(~factor(Smoking), Imputed_svy, na.rm = TRUE) * 100)
+```
+
+### Unexposed vs Exposed to Gas Stove Cooking (N, weighted %)
+
+(1) Gas Stove exposure and weights
+
+```{r warning=FALSE}
+table(Imputed_svy$variables$VTQ241A_bin, useNA = "ifany")  # Gas stove exposure
+coef(svymean(~factor(VTQ241A_bin), Imputed_svy, na.rm = TRUE) * 100)
+
+```
+
+(2) Asthma attack in last 12 months
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$MCQ040_bin == 1,
+  useNA = "ifany"
+)[, "TRUE"]
+
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# Unexposed weight
+# Unexposed weight
+coef(svymean(~factor(MCQ040_bin), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)[[2]] # this selects just the weight for when MCQ050_bin == 1
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# Exposed weight
+coef(svymean(~factor(MCQ040_bin), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100)[[2]] # this selects just the weight for when MCQ050_bin == 1
+```
+
+(3) Asthma ER Visit in last 12 months
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$MCQ050_bin == 1,
+  useNA = "ifany"
+)[, "TRUE"]
+
+
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# Unexposed weight
+coef(svymean(~factor(MCQ050_bin), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)[[2]] # this selects just the weight for when MCQ050_bin == 1
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# Exposed weight
+coef(svymean(~factor(MCQ050_bin), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100)[[2]] # this selects just the weight for when MCQ050_bin == 1
+
+```
+
+(4) Seniors
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$age_cat,
+  useNA = "ifany"
+)
+
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# unexposed
+# Unexposed weight
+coef(svymean(~factor(age_cat), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)# 
+
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# Exposed weight
+coef(svymean(~factor(age_cat), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100) # 
+```
+
+5.  Mean age (Standard Deviation)
+
+```{r warning=FALSE}
+Imputed_svy_unexposed <- subset(Imputed_svy, VTQ241A_bin == 0)
+Imputed_svy_exposed <- subset(Imputed_svy, VTQ241A_bin == 1)
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# unexposed
+# Unexposed
+mean(Imputed_svy_unexposed$variables$RIDAGEYR, na.rm = T)
+sd(Imputed_svy_unexposed$variables$RIDAGEYR, na.rm = T)
+
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# Exposed
+mean(Imputed_svy_exposed$variables$RIDAGEYR, na.rm = T)
+sd(Imputed_svy_exposed$variables$RIDAGEYR, na.rm = T)
+```
+
+6.  Race/Ethnicity
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$RaceEthn,
+  useNA = "ifany"
+)
+
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# unexposed
+coef(svymean(~factor(RaceEthn), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)# 
+
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# exposed
+coef(svymean(~factor(RaceEthn), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100) #
+```
+
+7.  Gender
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$RIAGENDR,
+  useNA = "ifany"
+)
+
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# unexposed
+coef(svymean(~factor(RIAGENDR), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)# 
+
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# exposed
+coef(svymean(~factor(RIAGENDR), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100) # 
+```
+
+8.  Poverty Income Ratio (PIR)
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$income_cat,
+  useNA = "ifany"
+)
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# unexposed
+coef(svymean(~factor(income_cat), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)# 
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# exposed
+coef(svymean(~factor(income_cat), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100) # 
+```
+
+### 
+
+9.  Housing Type
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$housing_status,
+  useNA = "ifany"
+)
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# unexposed
+coef(svymean(~factor(housing_status), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)# 
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# exposed
+coef(svymean(~factor(housing_status), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100) # 
+```
+
+### 
+
+10. Smoking status
+
+```{r warning=FALSE}
+options(survey.lonely.psu = "adjust")
+table(
+  Imputed_svy$variables$VTQ241A_bin,
+  Imputed_svy$variables$Smoking,
+  useNA = "ifany"
+)
+```
+
+Unexposed:
+
+```{r warning=FALSE}
+# unexposed
+coef(svymean(~factor(Smoking), subset(Imputed_svy, VTQ241A_bin == 0), na.rm = TRUE) * 100)# 
+```
+
+Exposed:
+
+```{r warning=FALSE}
+# exposed
+coef(svymean(~factor(Smoking), subset(Imputed_svy, VTQ241A_bin == 1), na.rm = TRUE) * 100) # 
+```
+
+## 5. Main Models (all, sex, housing status, income status)
+
+### All
+
+Predicting outcome by gas stove use, adjusting for sex, housing status, and income status.
+
+```{r model_main, warning=FALSE}
+
+# Exacerbations
+full_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1
+                              & housing_status != "Other")
+full_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = full_exac_SubSurvey,
+  family = quasibinomial(link = log)
+)
+
+# ER Visits
+full_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1
+                            & housing_status != "Other")
+full_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = full_ER_SubSurvey,
+  family = quasibinomial(link = log)
+)
+
+
+# Coefficients and 95% CIs
+OR <- exp(coef(full_exac_model))
+CI <- exp(confint(full_exac_model))
+full_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+full_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(full_ER_model))
+CI <- exp(confint(full_ER_model))
+full_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+full_ER_results
+
+
+```
+
+### Stratified
+
+#### Age
+
+Ages 65 and older:
+
+```{r model_age, warning=FALSE}
+# Older adults
+older_exac_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 65 & MCQ035 == 1 & housing_status != "Other")
+older_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = older_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+older_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 65 & MCQ035 == 1 & housing_status != "Other")
+older_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = older_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+
+# Coefficients and 95% CIs
+OR <- exp(coef(older_exac_model))
+CI <- exp(confint(older_exac_model))
+older_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+older_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(older_ER_model))
+CI <- exp(confint(older_ER_model))
+older_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+older_ER_results
+```
+
+Ages 18-64:
+
+```{r warning=FALSE}
+# Younger adults
+yAdults_exac_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR < 65 & MCQ035 == 1 & housing_status != "Other")
+yAdults_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = yAdults_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+yAdults_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR < 65 & MCQ035 == 1 & housing_status != "Other")
+yAdults_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = yAdults_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(yAdults_exac_model))
+CI <- exp(confint(yAdults_exac_model))
+yAdults_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+yAdults_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(yAdults_ER_model))
+CI <- exp(confint(yAdults_ER_model))
+yAdults_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+yAdults_ER_results
+```
+
+#### Sex
+
+Males:
+
+```{r warning=FALSE}
+male_exac_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 1
+  & housing_status != "Other")
+male_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + income_cat + housing_status,
+  design = male_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+male_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 1
+  & housing_status != "Other")
+male_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + income_cat + housing_status,
+  design = male_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(male_exac_model))
+CI <- exp(confint(male_exac_model))
+male_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+male_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(male_ER_model))
+CI <- exp(confint(male_ER_model))
+male_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+male_ER_results
+```
+
+Females:
+
+```{r warning=FALSE}
+female_exac_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 2
+  & housing_status != "Other")
+female_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + income_cat + housing_status,
+  design = female_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+female_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 2
+  & housing_status != "Other")
+female_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + income_cat + housing_status,
+  design = female_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(female_exac_model))
+CI <- exp(confint(female_exac_model))
+female_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+female_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(female_ER_model))
+CI <- exp(confint(female_ER_model))
+female_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+female_ER_results
+```
+
+Low Income
+
+```{r warning=FALSE}
+LowInc_exac_SubSurvey <- subset(
+    VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "Low"
+    & housing_status != "Other")
+LowInc_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  design = LowInc_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = initial
+)
+
+LowInc_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "Low"
+  & housing_status != "Other")
+LowInc_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  design = LowInc_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = initial
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(LowInc_exac_model))
+CI <- exp(confint(LowInc_exac_model))
+LowInc_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+LowInc_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(LowInc_ER_model))
+CI <- exp(confint(LowInc_ER_model))
+LowInc_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+LowInc_ER_results
+```
+
+Moderate income
+
+```{r warning=FALSE}
+ModInc_exac_SubSurvey <- subset(
+    VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "Medium"
+    & housing_status != "Other")
+ModInc_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  design = ModInc_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+#  start = initial
+)
+
+ModInc_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "Medium"
+  & housing_status != "Other")
+ModInc_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  design = ModInc_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+#  start = initial
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(ModInc_exac_model))
+CI <- exp(confint(ModInc_exac_model))
+ModInc_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+ModInc_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(ModInc_ER_model))
+CI <- exp(confint(ModInc_ER_model))
+ModInc_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+ModInc_ER_results
+```
+
+High Income
+
+```{r warning=FALSE}
+HiInc_exac_SubSurvey <- subset(
+    VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "High"
+    & housing_status != "Other")
+HiInc_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  design = HiInc_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+#  start = initial
+)
+
+HiInc_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "High"
+  & housing_status != "Other")
+HiInc_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  design = HiInc_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+#  start = initial
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(HiInc_exac_model))
+CI <- exp(confint(HiInc_exac_model))
+HiInc_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+HiInc_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(HiInc_ER_model))
+CI <- exp(confint(HiInc_ER_model))
+HiInc_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+HiInc_ER_results
+```
+
+#### Home ownership
+
+Renters
+
+```{r warning=FALSE}
+Rent_exac_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Rented")
+Rent_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  design = Rent_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0)
+)
+
+Rent_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Rented")
+Rent_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  design = Rent_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0)
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Rent_exac_model))
+CI <- exp(confint(Rent_exac_model))
+Rent_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Rent_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Rent_ER_model))
+CI <- exp(confint(Rent_ER_model))
+Rent_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Rent_ER_results
+```
+
+Owners
+
+```{r warning=FALSE}
+Own_exac_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Owned")
+Own_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  design = Own_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+Own_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Owned")
+Own_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  design = Own_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(Own_exac_model))
+CI <- exp(confint(Own_exac_model))
+Own_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Own_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Own_ER_model))
+CI <- exp(confint(Own_ER_model))
+Own_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Own_ER_results
+```
+
+#### Race/Ethnicity
+
+Black
+
+```{r warning=FALSE}
+Black_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                               & RaceEthn == "Black" & housing_status != "Other")
+Black_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Black_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+Black_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                             & RaceEthn == "Black" & housing_status != "Other")
+Black_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Black_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Black_exac_model))
+CI <- exp(confint(Black_exac_model))
+Black_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Black_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Black_ER_model))
+CI <- exp(confint(Black_ER_model))
+Black_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Black_ER_results
+```
+
+Latinx
+
+```{r warning=FALSE}
+LatinX_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                                & RaceEthn == "LatinX" & housing_status != "Other")
+LatinX_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = LatinX_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+LatinX_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                              & RaceEthn == "LatinX" & housing_status != "Other")
+LatinX_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = LatinX_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(LatinX_exac_model))
+CI <- exp(confint(LatinX_exac_model))
+LatinX_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+LatinX_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(LatinX_ER_model))
+CI <- exp(confint(LatinX_ER_model))
+LatinX_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+LatinX_ER_results
+```
+
+Asian
+
+```{r warning=FALSE}
+Asian_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                                & RaceEthn == "Asian" & housing_status != "Other")
+Asian_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Asian_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+Asian_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                              & RaceEthn == "Asian" & housing_status != "Other")
+Asian_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Asian_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(Asian_exac_model))
+CI <- exp(confint(Asian_exac_model))
+Asian_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Asian_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Asian_ER_model))
+CI <- exp(confint(Asian_ER_model))
+Asian_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Asian_ER_results
+```
+
+Other/Multiple
+
+```{r warning=FALSE}
+OtherMulti_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                               & RaceEthn == "OtherMulti" & housing_status != "Other")
+OtherMulti_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = OtherMulti_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+OtherMulti_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                             & RaceEthn == "OtherMulti" & housing_status != "Other")
+OtherMulti_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = OtherMulti_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(OtherMulti_exac_model))
+CI <- exp(confint(OtherMulti_exac_model))
+OtherMulti_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+OtherMulti_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(OtherMulti_ER_model))
+CI <- exp(confint(OtherMulti_ER_model))
+OtherMulti_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+OtherMulti_ER_results
+```
+
+White
+
+```{r warning=FALSE}
+
+White_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                               & RaceEthn == "White" & housing_status != "Other")
+White_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = White_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+White_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                             & RaceEthn == "White" & housing_status != "Other")
+White_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = White_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(White_exac_model))
+CI <- exp(confint(White_exac_model))
+White_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+White_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(White_ER_model))
+CI <- exp(confint(White_ER_model))
+White_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+White_ER_results
+```
+
+BIPOC
+
+```{r warning=FALSE}
+Bipoc_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & Bipoc == "Yes" & housing_status != "Other")
+Bipoc_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Bipoc_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+Bipoc_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 & Bipoc == "Yes" & housing_status != "Other")
+Bipoc_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Bipoc_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Bipoc_exac_model))
+CI <- exp(confint(Bipoc_exac_model))
+Bipoc_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Bipoc_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Bipoc_ER_model))
+CI <- exp(confint(Bipoc_ER_model))
+Bipoc_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Bipoc_ER_results
+```
+
+#### Smoking Status
+
+Current
+
+```{r warning=FALSE}
+Smoke_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                               & Smoking == "Current" & housing_status != "Other")
+Smoke_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Smoke_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+Smoke_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                             & Smoking == "Current" & housing_status != "Other")
+Smoke_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = Smoke_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(Smoke_exac_model))
+CI <- exp(confint(Smoke_exac_model))
+Smoke_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Smoke_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Smoke_ER_model))
+CI <- exp(confint(Smoke_ER_model))
+Smoke_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Smoke_ER_results
+```
+
+Former
+
+```{r warning=FALSE}
+formerSmoke_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                                     & Smoking == "Former" & housing_status != "Other")
+formerSmoke_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = formerSmoke_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+formerSmoke_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                                   & Smoking == "Former" & housing_status != "Other")
+formerSmoke_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = formerSmoke_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(formerSmoke_exac_model))
+CI <- exp(confint(formerSmoke_exac_model))
+formerSmoke_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+formerSmoke_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(formerSmoke_ER_model))
+CI <- exp(confint(formerSmoke_ER_model))
+formerSmoke_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+formerSmoke_ER_results
+```
+
+Never
+
+```{r warning=FALSE}
+neverSmoke_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                                    & Smoking == "Never" & housing_status != "Other")
+neverSmoke_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = neverSmoke_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+neverSmoke_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1 
+                                  & Smoking == "Never" & housing_status != "Other")
+neverSmoke_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = neverSmoke_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(neverSmoke_exac_model))
+CI <- exp(confint(neverSmoke_exac_model))
+neverSmoke_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+neverSmoke_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(neverSmoke_ER_model))
+CI <- exp(confint(neverSmoke_ER_model))
+neverSmoke_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+neverSmoke_ER_results
+```
+
+
+
+## 6. Sensitivity Analyses
+
+### Unweighted models
+
+
+```{r model_GLM, warning=FALSE, message=FALSE}
+
+# Exacerbations
+full_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1
+                              & housing_status != "Other")
+full_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = full_exac_SubSurvey,
+  family = quasibinomial(link = log)
+)
+
+# ER Visits
+full_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1
+                            & housing_status != "Other")
+full_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = full_ER_SubSurvey,
+  family = quasibinomial(link = log),
+)
+
+
+# Coefficients and 95% CIs
+OR <- exp(coef(full_exac_model))
+CI <- exp(confint(full_exac_model))
+full_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+full_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(full_ER_model))
+CI <- exp(confint(full_ER_model))
+full_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+full_ER_results
+
+
+```
+
+### Stratified
+
+#### Age
+
+Ages 65 and older:
+
+```{r model_age_GLM, warning=FALSE, message=FALSE}
+# Older adults
+older_exac_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 65 & MCQ035 == 1 & housing_status != "Other")
+older_exac_model <- svyglm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = older_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+older_ER_SubSurvey <- subset(
+  VOC_svy_design, RIDAGEYR >= 65 & MCQ035 == 1 & housing_status != "Other")
+older_ER_model <- svyglm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  design = older_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+
+# Coefficients and 95% CIs
+OR <- exp(coef(older_exac_model))
+CI <- exp(confint(older_exac_model))
+older_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+older_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(older_ER_model))
+CI <- exp(confint(older_ER_model))
+older_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+older_ER_results
+```
+
+Ages 18-64:
+
+```{r warning=FALSE, message=FALSE}
+# Younger adults
+yAdults_exac_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR < 65 & MCQ035 == 1 & housing_status != "Other")
+yAdults_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = yAdults_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+yAdults_ER_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR < 65 & MCQ035 == 1 & housing_status != "Other")
+yAdults_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = yAdults_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(yAdults_exac_model))
+CI <- exp(confint(yAdults_exac_model))
+yAdults_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+yAdults_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(yAdults_ER_model))
+CI <- exp(confint(yAdults_ER_model))
+yAdults_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+yAdults_ER_results
+```
+
+#### Sex
+
+Males:
+
+```{r warning=FALSE, message=FALSE}
+male_exac_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 1
+  & housing_status != "Other")
+male_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + income_cat + housing_status,
+  data = male_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+male_ER_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 1
+  & housing_status != "Other")
+male_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + income_cat + housing_status,
+  data = male_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(male_exac_model))
+CI <- exp(confint(male_exac_model))
+male_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+male_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(male_ER_model))
+CI <- exp(confint(male_ER_model))
+male_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+male_ER_results
+```
+
+Females:
+
+```{r warning=FALSE, message=FALSE}
+female_exac_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 2
+  & housing_status != "Other")
+female_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + income_cat + housing_status,
+  data = female_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+female_ER_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & RIAGENDR == 2
+  & housing_status != "Other")
+female_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + income_cat + housing_status,
+  data = female_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(female_exac_model))
+CI <- exp(confint(female_exac_model))
+female_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+female_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(female_ER_model))
+CI <- exp(confint(female_ER_model))
+female_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+female_ER_results
+```
+
+
+#### Income
+
+```{r warning=FALSE, message=FALSE}
+LowInc_exac_SubSurvey <- subset(
+    VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "Low"
+    & housing_status != "Other")
+LowInc_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  data = LowInc_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = initial
+)
+
+LowInc_ER_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & income_cat == "Low"
+  & housing_status != "Other")
+LowInc_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + housing_status,
+  data = LowInc_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = initial
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(LowInc_exac_model))
+CI <- exp(confint(LowInc_exac_model))
+LowInc_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+LowInc_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(LowInc_ER_model))
+CI <- exp(confint(LowInc_ER_model))
+LowInc_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+LowInc_ER_results
+```
+
+#### Home ownership
+
+Renters
+
+```{r warning=FALSE, message=FALSE}
+Rent_exac_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Rented")
+Rent_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  data = Rent_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0)
+)
+
+Rent_ER_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Rented")
+Rent_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  data = Rent_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0)
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Rent_exac_model))
+CI <- exp(confint(Rent_exac_model))
+Rent_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Rent_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Rent_ER_model))
+CI <- exp(confint(Rent_ER_model))
+Rent_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Rent_ER_results
+```
+
+Owners
+
+```{r warning=FALSE, message=FALSE}
+Own_exac_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Owned")
+Own_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  data = Own_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+Own_ER_SubSurvey <- subset(
+  VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & housing_status == "Owned")
+Own_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat,
+  data = Own_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(Own_exac_model))
+CI <- exp(confint(Own_exac_model))
+Own_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Own_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Own_ER_model))
+CI <- exp(confint(Own_ER_model))
+Own_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Own_ER_results
+```
+
+#### Race/Ethnicity
+
+Black
+
+```{r warning=FALSE, message=FALSE}
+Black_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                               & RaceEthn == "Black" & housing_status != "Other")
+Black_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Black_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+Black_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                             & RaceEthn == "Black" & housing_status != "Other")
+Black_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Black_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Black_exac_model))
+CI <- exp(confint(Black_exac_model))
+Black_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Black_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Black_ER_model))
+CI <- exp(confint(Black_ER_model))
+Black_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Black_ER_results
+```
+
+Latinx
+
+```{r warning=FALSE, message=FALSE}
+LatinX_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                                & RaceEthn == "LatinX" & housing_status != "Other")
+LatinX_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = LatinX_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+LatinX_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                              & RaceEthn == "LatinX" & housing_status != "Other")
+LatinX_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = LatinX_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(LatinX_exac_model))
+CI <- exp(confint(LatinX_exac_model))
+LatinX_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+LatinX_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(LatinX_ER_model))
+CI <- exp(confint(LatinX_ER_model))
+LatinX_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+LatinX_ER_results
+```
+
+Asian
+
+```{r warning=FALSE, message=FALSE}
+Asian_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                                & RaceEthn == "Asian" & housing_status != "Other")
+Asian_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Asian_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+
+Asian_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                              & RaceEthn == "Asian" & housing_status != "Other")
+Asian_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Asian_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(Asian_exac_model))
+CI <- exp(confint(Asian_exac_model))
+Asian_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Asian_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Asian_ER_model))
+CI <- exp(confint(Asian_ER_model))
+Asian_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Asian_ER_results
+```
+
+Other/Multiple
+
+White
+
+```{r warning=FALSE, message=FALSE}
+
+White_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                               & RaceEthn == "White" & housing_status != "Other")
+White_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = White_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+White_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                             & RaceEthn == "White" & housing_status != "Other")
+White_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = White_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(White_exac_model))
+CI <- exp(confint(White_exac_model))
+White_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+White_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(White_ER_model))
+CI <- exp(confint(White_ER_model))
+White_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+White_ER_results
+```
+
+BIPOC
+
+```{r warning=FALSE, message=FALSE}
+Bipoc_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & Bipoc == "Yes" & housing_status != "Other")
+Bipoc_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Bipoc_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+Bipoc_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 & Bipoc == "Yes" & housing_status != "Other")
+Bipoc_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Bipoc_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Bipoc_exac_model))
+CI <- exp(confint(Bipoc_exac_model))
+Bipoc_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Bipoc_exac_results
+
+# Coefficients and 95% CIs
+OR <- exp(coef(Bipoc_ER_model))
+CI <- exp(confint(Bipoc_ER_model))
+Bipoc_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Bipoc_ER_results
+```
+
+#### Smoking Status
+
+Current
+
+```{r warning=FALSE, message=FALSE}
+Smoke_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                               & Smoking == "Current" & housing_status != "Other")
+Smoke_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Smoke_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+Smoke_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                             & Smoking == "Current" & housing_status != "Other")
+Smoke_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = Smoke_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(Smoke_exac_model))
+CI <- exp(confint(Smoke_exac_model))
+Smoke_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+Smoke_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(Smoke_ER_model))
+CI <- exp(confint(Smoke_ER_model))
+Smoke_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+Smoke_ER_results
+```
+
+Former
+
+```{r warning=FALSE, message=FALSE}
+formerSmoke_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                                     & Smoking == "Former" & housing_status != "Other")
+formerSmoke_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = formerSmoke_exac_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+formerSmoke_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                                   & Smoking == "Former" & housing_status != "Other")
+formerSmoke_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = formerSmoke_ER_SubSurvey,
+  family = quasibinomial(link = "log"),
+  start = c(log(mean(Unweighted_Imp$VTQ241A_bin == 0, na.rm=T)), 0, 0, 0, 0, 0)
+)
+# Coefficients and 95% CIs
+OR <- exp(coef(formerSmoke_exac_model))
+CI <- exp(confint(formerSmoke_exac_model))
+formerSmoke_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+formerSmoke_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(formerSmoke_ER_model))
+CI <- exp(confint(formerSmoke_ER_model))
+formerSmoke_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+formerSmoke_ER_results
+```
+
+Never
+
+```{r warning=FALSE, message=FALSE}
+neverSmoke_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                                    & Smoking == "Never" & housing_status != "Other")
+neverSmoke_exac_model <- glm(
+  MCQ040_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = neverSmoke_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+neverSmoke_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1 
+                                  & Smoking == "Never" & housing_status != "Other")
+neverSmoke_ER_model <- glm(
+  MCQ050_bin ~ VTQ241A_bin + RIAGENDR + income_cat + housing_status,
+  data = neverSmoke_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(neverSmoke_exac_model))
+CI <- exp(confint(neverSmoke_exac_model))
+neverSmoke_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+neverSmoke_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(neverSmoke_ER_model))
+CI <- exp(confint(neverSmoke_ER_model))
+neverSmoke_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+neverSmoke_ER_results
+```
+
+
+### Smoking and asthma association
+
+Asthma and smoking exposure - if NHANES is capturing data well, we would expect to see an association for this model. This is a well-documented association!
+
+#### Weighted model
+
+```{r warning=FALSE}
+SmokeExp_exac_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1)
+SmokeExp_exac_model <- svyglm(
+  MCQ040_bin ~ SMQ040_bin + RIAGENDR + income_cat + housing_status,
+  design = SmokeExp_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+SmokeExp_ER_SubSurvey <- subset(VOC_svy_design, RIDAGEYR >= 18 & MCQ035 == 1)
+SmokeExp_ER_model <- svyglm(
+  MCQ050_bin ~ SMQ040_bin + RIAGENDR + income_cat + housing_status,
+  design = SmokeExp_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(SmokeExp_exac_model))
+CI <- exp(confint(SmokeExp_exac_model))
+SmokeExp_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+SmokeExp_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(SmokeExp_ER_model))
+CI <- exp(confint(SmokeExp_ER_model))
+SmokeExp_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+SmokeExp_ER_results
+```
+
+
+#### Unweighted model
+
+
+```{r warning=FALSE}
+SmokeExp_exac_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1)
+SmokeExp_exac_model <- glm(
+  MCQ040_bin ~ SMQ040_bin + RIAGENDR + income_cat + housing_status,
+  data = SmokeExp_exac_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+SmokeExp_ER_SubSurvey <- subset(VOC_imputed, RIDAGEYR >= 18 & MCQ035 == 1)
+SmokeExp_ER_model <- glm(
+  MCQ050_bin ~ SMQ040_bin + RIAGENDR + income_cat + housing_status,
+  data = SmokeExp_ER_SubSurvey,
+  family = quasibinomial(link = "log")
+)
+
+# Coefficients and 95% CIs
+OR <- exp(coef(SmokeExp_exac_model))
+CI <- exp(confint(SmokeExp_exac_model))
+SmokeExp_exac_results <- data.frame(
+  Exac_OR = OR,
+  Exac_CI_lower = CI[, 1],
+  Exac_CI_upper = CI[, 2]
+)
+
+SmokeExp_exac_results
+# Coefficients and 95% CIs
+OR <- exp(coef(SmokeExp_ER_model))
+CI <- exp(confint(SmokeExp_ER_model))
+SmokeExp_ER_results <- data.frame(
+  ER_OR = OR,
+  ER_CI_lower = CI[, 1],
+  ER_CI_upper = CI[, 2]
+)
+
+SmokeExp_ER_results
+```
